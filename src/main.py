@@ -8,13 +8,16 @@
 
 import os
 import sys
+import time
 import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 # Define polite User-Agent identification header
 USER_AGENT = "FlyRankInternship-A9/1.0 (+https://github.com/Mirah-003/polite-scraper)"
 HEADERS = {"User-Agent": USER_AGENT}
 
-# Create required directories if they don't exist
+# Create required directories
 os.makedirs("cache", exist_ok=True)
 os.makedirs("output", exist_ok=True)
 
@@ -25,10 +28,7 @@ os.makedirs("output", exist_ok=True)
 def fetch_page(url: str, cache_filename: str, timeout: int = 10) -> tuple[str, bool]:
     """
     Politely fetches a web page or loads it from local disk cache.
-    
-    - Returns tuple: (html_content, is_cache_hit)
-    - If cache_filename exists in cache/ -> reads disk (CACHE HIT).
-    - If missing -> sends HTTP GET request, checks 200 OK, writes to cache/ (FETCH).
+    Returns: (html_content, is_cache_hit)
     """
     cache_filepath = os.path.join("cache", cache_filename)
     
@@ -38,17 +38,15 @@ def fetch_page(url: str, cache_filename: str, timeout: int = 10) -> tuple[str, b
             content = f.read()
         print(f"CACHE HIT | File: {cache_filename} | Size: {len(content)} bytes")
         return content, True
-    # 2. Network Fetch (If not in cache)
+    # 2. Network Fetch (If missing from cache)
     try:
         response = requests.get(url, headers=HEADERS, timeout=timeout)
         
-        # Verify HTTP status code
         if response.status_code != 200:
             raise RuntimeError(f"HTTP Error {response.status_code} when fetching {url}")
             
         content = response.text
         
-        # Save HTML to cache file on disk
         with open(cache_filepath, "w", encoding="utf-8") as f:
             f.write(content)
             
@@ -57,41 +55,64 @@ def fetch_page(url: str, cache_filename: str, timeout: int = 10) -> tuple[str, b
     except requests.RequestException as e:
         raise RuntimeError(f"Network failure for {url}: {e}")
 
+
 # ==========================================
 # TODO 2 — Find All Three Pages (Pagination Crawler)
 # ==========================================
 
-# PSEUDOCODE & VISUAL MECHANICS:
-# Function discover_book_urls(base_url: str, max_pages: int = 3) -> list[dict]:
-#   """
-#   WHY THIS WAY: Dynamically follows 'next' links instead of hardcoding URLs.
-#   Uses urljoin() to resolve relative links like '../a-light-in-the-attic_1000/index.html'.
-#   """
-#   Initialize discovered_books = []
-#   Initialize current_url = base_url
-#   Initialize page_count = 0
-#
-#   While current_url and page_count < max_pages:
-#     page_count += 1
-#     Fetch page HTML via fetch_page()
-#     If fetched from network -> time.sleep(0.5) (Politeness Throttling)
-#     Parse HTML with BeautifulSoup
-#
-#     Find all book cards (e.g. article.product_pod)
-#     For each card:
-#       Extract relative href from h3 -> a tag
-#       Convert to absolute URL: abs_url = urljoin(current_url, href)
-#       Append {"product_url": abs_url, "source_page": current_url} to list
-#
-#     Find pagination next button: li.next -> a tag
-#     If next button exists:
-#       Set current_url = urljoin(current_url, next_href)
-#     Else:
-#       Break
-#
-#   Deduplicate by product_url
-#   Return discovered_books list
+def discover_book_urls(start_url: str, max_pages: int = 3) -> list[dict]:
+    """
+    Crawls catalogue pagination starting from start_url up to max_pages.
+    Extracts book detail links, resolves them to absolute URLs using urljoin,
+    and returns a list of dictionaries with product_url and source_page.
+    """
+    discovered_books: list[dict] = []
+    current_url = start_url
+    page_count = 0
+    while current_url and page_count < max_pages:
+        page_count += 1
+        cache_file = f"catalogue-page-{page_count}.html"
+        
+        # Fetch page HTML
+        html_content, is_cache_hit = fetch_page(url=current_url, cache_filename=cache_file)
+        
+        # Apply 0.5s politeness delay ONLY if fetched over network
+        if not is_cache_hit:
+            time.sleep(0.5)
+        # Parse HTML with BeautifulSoup
+        soup = BeautifulSoup(html_content, "html.parser")
+        # Extract book links from article.product_pod containers
+        articles = soup.find_all("article", class_="product_pod")
 
+        for article in articles:
+            h3_tag = article.find("h3")
+            if h3_tag and h3_tag.find("a"):
+                relative_href = h3_tag.find("a")["href"]
+                # Safe URL resolution using urljoin
+                abs_product_url = urljoin(current_url, relative_href)
+                
+                discovered_books.append({
+                    "product_url": abs_product_url,
+                    "source_page": current_url
+                })
+
+        # Follow pagination "next" button if present
+        next_li = soup.find("li", class_="next")
+        if next_li and next_li.find("a"):
+            next_relative_href = next_li.find("a")["href"]
+            current_url = urljoin(current_url, next_relative_href)
+        else:
+            current_url = None
+
+    # Deduplicate books while preserving order
+    seen_urls = set()
+    unique_books = []
+    for book in discovered_books:
+        if book["product_url"] not in seen_urls:
+            seen_urls.add(book["product_url"])
+            unique_books.append(book)
+    print(f"\nCHECKPOINT — catalogue_pages={page_count}, discovered={len(discovered_books)}, unique_urls={len(unique_books)}")
+    return unique_books
 
 # ==========================================
 # TODO 3 — Extract Raw Book Records
@@ -167,10 +188,9 @@ def fetch_page(url: str, cache_filename: str, timeout: int = 10) -> tuple[str, b
 #   Write metrics to output/run-report.json
 
 def main() -> None:
-    # Test Stage 1: Fetch and cache Catalogue Page 1
-    target_url = "https://books.toscrape.com/catalogue/page-1.html"
-    cache_file = "catalogue-page-1.html"
+    start_catalogue_url = "https://books.toscrape.com/catalogue/page-1.html"
     
-    fetch_page(url=target_url, cache_filename=cache_file)
+    # Run Stage 2 Crawler
+    discovered = discover_book_urls(start_url=start_catalogue_url, max_pages=3)
 if __name__ == "__main__":
     main()
