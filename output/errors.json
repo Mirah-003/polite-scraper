@@ -1,1 +1,6 @@
-[]
+[
+  {
+    "product_url": "https://books.toscrape.com/catalogue/non-existent-broken-book_9999/index.html",
+    "error_reason": "HTTP 404 (Non-retryable) for https://books.toscrape.com/catalogue/non-existent-broken-book_9999/index.html"
+  }
+]

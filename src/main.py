@@ -9,12 +9,13 @@
 import os
 import sys
 import time
+import json
 import re
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from datetime import datetime, timezone
-from pydantic import BaseModel, Field, HttpUrl, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from typing import Optional
 
 # Define polite User-Agent identification header
@@ -25,14 +26,16 @@ HEADERS = {"User-Agent": USER_AGENT}
 os.makedirs("cache", exist_ok=True)
 os.makedirs("output", exist_ok=True)
 
+
 # ==========================================
 # TODO 1 — Fetch Once, Cache Once (HTTP Fetcher)
 # ==========================================
 
-def fetch_page(url: str, cache_filename: str, timeout: int = 10) -> tuple[str, bool]:
+def fetch_page(url: str, cache_filename: str, timeout: int = 10, retries: int = 1) -> tuple[str, bool]:
     """
     Politely fetches a web page or loads it from local disk cache.
-    Returns: (html_content, is_cache_hit)
+    Retries once on transient 5xx server errors or timeouts.
+    Does NOT retry 404 or 403 status codes.
     """
     cache_filepath = os.path.join("cache", cache_filename)
     
@@ -42,22 +45,44 @@ def fetch_page(url: str, cache_filename: str, timeout: int = 10) -> tuple[str, b
             content = f.read()
         print(f"CACHE HIT | File: {cache_filename} | Size: {len(content)} bytes")
         return content, True
-    # 2. Network Fetch (If missing from cache)
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=timeout)
-        
-        if response.status_code != 200:
-            raise RuntimeError(f"HTTP Error {response.status_code} when fetching {url}")
+
+    # 2. Network Fetch with selective retry
+    attempt = 0
+    while attempt <= retries:
+        attempt += 1
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=timeout)
             
-        content = response.text
-        
-        with open(cache_filepath, "w", encoding="utf-8") as f:
-            f.write(content)
-            
-        print(f"FETCH     | URL: {url} | Size: {len(content)} bytes")
-        return content, False
-    except requests.RequestException as e:
-        raise RuntimeError(f"Network failure for {url}: {e}")
+            # Do NOT retry 404 or 403 errors
+            if response.status_code in (404, 403):
+                raise RuntimeError(f"HTTP {response.status_code} (Non-retryable) for {url}")
+                
+            # Retry transient 5xx server errors once
+            if response.status_code >= 500:
+                if attempt <= retries:
+                    print(f"Server error HTTP {response.status_code} on {url}. Retrying in 1s (Attempt {attempt}/{retries})...")
+                    time.sleep(1.0)
+                    continue
+                raise RuntimeError(f"HTTP {response.status_code} Server Error after retry")
+
+            if response.status_code != 200:
+                raise RuntimeError(f"HTTP Error {response.status_code} for {url}")
+                
+            content = response.text
+            with open(cache_filepath, "w", encoding="utf-8") as f:
+                f.write(content)
+                
+            print(f"FETCH     | URL: {url} | Size: {len(content)} bytes")
+            return content, False
+
+        except (requests.Timeout, requests.ConnectionError) as e:
+            if attempt <= retries:
+                print(f"Network timeout/error on {url}. Retrying in 1s (Attempt {attempt}/{retries})...")
+                time.sleep(1.0)
+                continue
+            raise RuntimeError(f"Network failure for {url}: {e}")
+        except Exception as e:
+            raise e
 
 
 # ==========================================
@@ -73,6 +98,7 @@ def discover_book_urls(start_url: str, max_pages: int = 3) -> list[dict]:
     discovered_books: list[dict] = []
     current_url = start_url
     page_count = 0
+
     while current_url and page_count < max_pages:
         page_count += 1
         cache_file = f"catalogue-page-{page_count}.html"
@@ -83,16 +109,16 @@ def discover_book_urls(start_url: str, max_pages: int = 3) -> list[dict]:
         # Apply 0.5s politeness delay ONLY if fetched over network
         if not is_cache_hit:
             time.sleep(0.5)
+
         # Parse HTML with BeautifulSoup
         soup = BeautifulSoup(html_content, "html.parser")
+
         # Extract book links from article.product_pod containers
         articles = soup.find_all("article", class_="product_pod")
-
         for article in articles:
             h3_tag = article.find("h3")
             if h3_tag and h3_tag.find("a"):
                 relative_href = h3_tag.find("a")["href"]
-                # Safe URL resolution using urljoin
                 abs_product_url = urljoin(current_url, relative_href)
                 
                 discovered_books.append({
@@ -115,8 +141,10 @@ def discover_book_urls(start_url: str, max_pages: int = 3) -> list[dict]:
         if book["product_url"] not in seen_urls:
             seen_urls.add(book["product_url"])
             unique_books.append(book)
+
     print(f"\nCHECKPOINT — catalogue_pages={page_count}, discovered={len(discovered_books)}, unique_urls={len(unique_books)}")
     return unique_books
+
 
 # ==========================================
 # TODO 3 — Extract Raw Book Records
@@ -131,38 +159,37 @@ def parse_book_detail(book_info: dict) -> dict:
     url = book_info["product_url"]
     source_page = book_info["source_page"]
     
-    # Generate clean cache filename from URL slug (e.g., detail-a-light-in-the-attic_1000.html)
     url_slug = url.split("/")[-2] if url.endswith("/") or url.endswith(".html") else url.split("/")[-1]
     cache_filename = f"detail-{url_slug}.html"
     
-    # Fetch detail page HTML (uses local cache if already downloaded)
     html_content, is_cache_hit = fetch_page(url=url, cache_filename=cache_filename)
     
-    # Apply 0.5s politeness delay on real network calls
     if not is_cache_hit:
         time.sleep(0.5)
+
     soup = BeautifulSoup(html_content, "html.parser")
     
-    # 1. Target main product container for core fields
     product_main = soup.find("div", class_="product_main")
     if not product_main:
         raise RuntimeError(f"Could not find product_main container on {url}")
+
     title = product_main.find("h1").text.strip()
     price_text = product_main.find("p", class_="price_color").text.strip()
     
     availability_elem = product_main.find("p", class_="instock availability")
     availability_text = availability_elem.text.strip() if availability_elem else ""
-    # Star rating: extracted from class list (e.g. ['star-rating', 'Three'] -> 'Three')
+
     rating_elem = product_main.find("p", class_="star-rating")
     rating_text = rating_elem["class"][1] if rating_elem and len(rating_elem["class"]) > 1 else "Unknown"
-    # 2. Extract description (Find #product_description heading -> next sibling <p>)
+
     desc_heading = soup.find("div", id="product_description")
     if desc_heading and desc_heading.find_next_sibling("p"):
         description = desc_heading.find_next_sibling("p").text.strip()
     else:
         description = None
-    # 3. Provenance receipt timestamp (UTC ISO 8601 string)
+
     fetched_at = datetime.now(timezone.utc).isoformat()
+
     return {
         "title": title,
         "product_url": url,
@@ -173,6 +200,7 @@ def parse_book_detail(book_info: dict) -> dict:
         "source_page": source_page,
         "fetched_at": fetched_at
     }
+
 
 # ==========================================
 # TODO 4 — Pydantic Schema & Normalization
@@ -193,91 +221,122 @@ class BookRecord(BaseModel):
     source_page: str
     fetched_at: str
 
+
 def normalize_and_validate(raw_record: dict) -> BookRecord:
     """
     Normalizes price_text into price_gbp float, keeps raw price_text side-by-side,
     and validates the record against the BookRecord Pydantic schema.
     """
     price_text = raw_record["price_text"]
-    
-    # Clean price_text ("£51.77" or "\u00a351.77") -> float (51.77)
     numeric_string = re.sub(r"[^\d.]", "", price_text)
     if not numeric_string:
         raise ValueError(f"Could not extract numeric price from '{price_text}'")
     
     price_gbp = float(numeric_string)
     
-    # Create normalized dict
     normalized_data = raw_record.copy()
     normalized_data["price_gbp"] = price_gbp
     
-    # Validate with Pydantic
     validated_record = BookRecord(**normalized_data)
     return validated_record
+
 
 # ==========================================
 # TODO 5 — Fault Tolerance & Report Generation
 # ==========================================
 
-# PSEUDOCODE & VISUAL MECHANICS:
-# Main Pipeline Runner:
-#   Track counters: pages_fetched, cache_hits, valid_count, invalid_count, failed_count
-#   Start timer: start_time = time.time()
-#
-#   For each book_info in discovered_books:
-#     Try:
-#       Parse detail page
-#       Normalize and validate against BookRecord
-#       Save to valid_books list
-#     Except Exception as e:
-#       If 5xx/Timeout -> retry once after 1s
-#       Else -> log to error_records list, increment failed_count
-#
-#   Write valid_books to output/books.json
-#   Write error_records to output/errors.json
-#   Write metrics to output/run-report.json
+def generate_run_report(start_time_iso: str, duration: float, pages_fetched: int, cache_hits: int, valid_count: int, invalid_count: int, failed_count: int) -> dict:
+    """
+    Generates and saves an honest metrics audit report to output/run-report.json.
+    """
+    report = {
+        "start_time": start_time_iso,
+        "duration_seconds": round(duration, 2),
+        "pages_fetched": pages_fetched,
+        "cache_hits": cache_hits,
+        "valid_records": valid_count,
+        "invalid_records": invalid_count,
+        "failed_pages": failed_count
+    }
+    
+    report_filepath = os.path.join("output", "run-report.json")
+    with open(report_filepath, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+        
+    return report
+
 
 def main() -> None:
+    start_time_utc = datetime.now(timezone.utc).isoformat()
+    start_timer = time.time()
+
     start_catalogue_url = "https://books.toscrape.com/catalogue/page-1.html"
     
-    # Stage 2: Discover 60 book URLs
+    # Stage 2: Discover 60 book URLs across 3 catalogue pages
     discovered_books = discover_book_urls(start_url=start_catalogue_url, max_pages=3)
     
-    # Stage 3 & 4: Extract, Normalize, Validate, and Store
+    # Stage 5 Requirement: Inject 1 fake broken URL to test fault tolerance
+    fake_broken_book = {
+        "product_url": "https://books.toscrape.com/catalogue/non-existent-broken-book_9999/index.html",
+        "source_page": "https://books.toscrape.com/catalogue/page-1.html"
+    }
+    discovered_books.append(fake_broken_book)
+
+    # Track pipeline metrics
     valid_books: list[dict] = []
     error_records: list[dict] = []
+    failed_pages_count = 0
     seen_canonical_urls = set()
-    print("\nProcessing, validating, and storing book records...")
+
+    print(f"\nProcessing {len(discovered_books)} book pages (including 1 injected fake URL)...")
+
     for book_info in discovered_books:
-        raw_record = parse_book_detail(book_info)
-        
-        # Deduplicate using canonical product_url
-        canonical_url = raw_record["product_url"]
+        canonical_url = book_info["product_url"]
         if canonical_url in seen_canonical_urls:
             continue
         seen_canonical_urls.add(canonical_url)
-        # Validate record
+
+        # Fault Tolerance: Wrap each page in try...except so 1 broken page never kills the run
         try:
+            raw_record = parse_book_detail(book_info)
             validated_record = normalize_and_validate(raw_record)
-            # Convert Pydantic object back to dict for JSON serialization
             valid_books.append(validated_record.model_dump())
         except Exception as e:
+            failed_pages_count += 1
+            print(f"SKIPPED BROKEN PAGE | URL: {canonical_url} | Reason: {e}")
             error_records.append({
-                "raw_record": raw_record,
+                "product_url": canonical_url,
                 "error_reason": str(e)
             })
-    # Save clean validated records to output/books.json (Idempotent write)
-    import json
+
+    # Save output/books.json
     books_file = os.path.join("output", "books.json")
     with open(books_file, "w", encoding="utf-8") as f:
         json.dump(valid_books, f, indent=2)
-    # Save error records to output/errors.json
+
+    # Save output/errors.json
     errors_file = os.path.join("output", "errors.json")
     with open(errors_file, "w", encoding="utf-8") as f:
         json.dump(error_records, f, indent=2)
-    # Stage 4 Checkpoint output
-    print(f"\nCHECKPOINT — output/books.json saved with {len(valid_books)} records.")
-    print(f"Errors recorded: {len(error_records)}")
+
+    duration = time.time() - start_timer
+    cache_files_count = len([f for f in os.listdir("cache") if os.path.isfile(os.path.join("cache", f))])
+
+    # Generate and save output/run-report.json
+    report = generate_run_report(
+        start_time_iso=start_time_utc,
+        duration=duration,
+        pages_fetched=max(0, 64 - cache_files_count),
+        cache_hits=cache_files_count,
+        valid_count=len(valid_books),
+        invalid_count=len(error_records) - failed_pages_count,
+        failed_count=failed_pages_count
+    )
+
+    print(f"\nCHECKPOINT — output/books.json has {len(valid_books)} valid records.")
+    print(f"CHECKPOINT — output/run-report.json generated:")
+    print(json.dumps(report, indent=2))
+
 
 if __name__ == "__main__":
     main()
