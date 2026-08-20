@@ -9,10 +9,13 @@
 import os
 import sys
 import time
+import re
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from datetime import datetime, timezone
+from pydantic import BaseModel, Field, HttpUrl, ValidationError
+from typing import Optional
 
 # Define polite User-Agent identification header
 USER_AGENT = "FlyRankInternship-A9/1.0 (+https://github.com/Mirah-003/polite-scraper)"
@@ -175,25 +178,42 @@ def parse_book_detail(book_info: dict) -> dict:
 # TODO 4 — Pydantic Schema & Normalization
 # ==========================================
 
-# PSEUDOCODE & VISUAL MECHANICS:
-# Define Pydantic Schema:
-# Class BookRecord(BaseModel):
-#     title: str
-#     product_url: str
-#     price_text: str
-#     price_gbp: float          # Normalized numeric value
-#     availability_text: str
-#     rating_text: str
-#     description: Optional[str] = None
-#     source_page: str
-#     fetched_at: str
+class BookRecord(BaseModel):
+    """
+    Pydantic schema for a validated, normalized book record.
+    Enforces required fields, float price_gbp, and optional description.
+    """
+    title: str
+    product_url: str
+    price_text: str
+    price_gbp: float = Field(..., description="Normalized price in GBP as a float number")
+    availability_text: str
+    rating_text: str
+    description: Optional[str] = None
+    source_page: str
+    fetched_at: str
 
-# Function normalize_record(raw_record: dict) -> BookRecord:
-#   price_numeric = float(raw_record["price_text"].replace("£", "").strip())
-#   normalized_dict = raw_record.copy()
-#   normalized_dict["price_gbp"] = price_numeric
-#   Return BookRecord(**normalized_dict)
-
+def normalize_and_validate(raw_record: dict) -> BookRecord:
+    """
+    Normalizes price_text into price_gbp float, keeps raw price_text side-by-side,
+    and validates the record against the BookRecord Pydantic schema.
+    """
+    price_text = raw_record["price_text"]
+    
+    # Clean price_text ("£51.77" or "\u00a351.77") -> float (51.77)
+    numeric_string = re.sub(r"[^\d.]", "", price_text)
+    if not numeric_string:
+        raise ValueError(f"Could not extract numeric price from '{price_text}'")
+    
+    price_gbp = float(numeric_string)
+    
+    # Create normalized dict
+    normalized_data = raw_record.copy()
+    normalized_data["price_gbp"] = price_gbp
+    
+    # Validate with Pydantic
+    validated_record = BookRecord(**normalized_data)
+    return validated_record
 
 # ==========================================
 # TODO 5 — Fault Tolerance & Report Generation
@@ -220,21 +240,44 @@ def parse_book_detail(book_info: dict) -> dict:
 def main() -> None:
     start_catalogue_url = "https://books.toscrape.com/catalogue/page-1.html"
     
-    # Stage 2: Discover 60 book URLs across 3 catalogue pages
+    # Stage 2: Discover 60 book URLs
     discovered_books = discover_book_urls(start_url=start_catalogue_url, max_pages=3)
     
-    # Stage 3: Extract raw records from all 60 book pages
-    raw_records = []
-    print("\nFetching and extracting book detail pages...")
-    
+    # Stage 3 & 4: Extract, Normalize, Validate, and Store
+    valid_books: list[dict] = []
+    error_records: list[dict] = []
+    seen_canonical_urls = set()
+    print("\nProcessing, validating, and storing book records...")
     for book_info in discovered_books:
         raw_record = parse_book_detail(book_info)
-        raw_records.append(raw_record)
-    # Print Stage 3 Checkpoint output
-    print(f"\nCHECKPOINT — detail_pages={len(raw_records)}")
-    print("\nSample Raw Record (All 8 keys):")
+        
+        # Deduplicate using canonical product_url
+        canonical_url = raw_record["product_url"]
+        if canonical_url in seen_canonical_urls:
+            continue
+        seen_canonical_urls.add(canonical_url)
+        # Validate record
+        try:
+            validated_record = normalize_and_validate(raw_record)
+            # Convert Pydantic object back to dict for JSON serialization
+            valid_books.append(validated_record.model_dump())
+        except Exception as e:
+            error_records.append({
+                "raw_record": raw_record,
+                "error_reason": str(e)
+            })
+    # Save clean validated records to output/books.json (Idempotent write)
     import json
-    print(json.dumps(raw_records[0], indent=2))
+    books_file = os.path.join("output", "books.json")
+    with open(books_file, "w", encoding="utf-8") as f:
+        json.dump(valid_books, f, indent=2)
+    # Save error records to output/errors.json
+    errors_file = os.path.join("output", "errors.json")
+    with open(errors_file, "w", encoding="utf-8") as f:
+        json.dump(error_records, f, indent=2)
+    # Stage 4 Checkpoint output
+    print(f"\nCHECKPOINT — output/books.json saved with {len(valid_books)} records.")
+    print(f"Errors recorded: {len(error_records)}")
 
 if __name__ == "__main__":
     main()
