@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import json
+import csv
 import re
 import requests
 from bs4 import BeautifulSoup
@@ -266,6 +267,76 @@ def generate_run_report(start_time_iso: str, duration: float, pages_fetched: int
     return report
 
 
+# ==========================================
+# EXTRAS — CSV Export & HTML Dashboard
+# ==========================================
+
+def export_to_csv(records: list[dict], filepath: str) -> None:
+    """Export validated records to books.csv for spreadsheet users."""
+    if not records:
+        return
+    fieldnames = list(records[0].keys())
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(records)
+
+
+def generate_html_dashboard(valid_books: list[dict], report: dict, filepath: str) -> None:
+    """Generates a sleek, single-page HTML metrics dashboard."""
+    prices = [b["price_gbp"] for b in valid_books if "price_gbp" in b]
+    avg_price = round(sum(prices) / len(prices), 2) if prices else 0.0
+    min_price = min(prices) if prices else 0.0
+    max_price = max(prices) if prices else 0.0
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Polite Scraper Metrics Dashboard</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #0f172a; color: #f8fafc; padding: 2rem; margin: 0; }}
+        .container {{ max-width: 900px; margin: 0 auto; }}
+        h1 {{ color: #38bdf8; margin-bottom: 0.25rem; }}
+        .subtitle {{ color: #94a3b8; font-size: 0.95rem; margin-bottom: 2rem; }}
+        .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 1.25rem; }}
+        .card {{ background: #1e293b; padding: 1.5rem; border-radius: 12px; border: 1px solid #334155; }}
+        .card-label {{ color: #94a3b8; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+        .metric {{ font-size: 2.2rem; font-weight: 700; color: #38bdf8; margin-top: 0.5rem; }}
+        .status-badge {{ display: inline-block; padding: 0.25rem 0.75rem; border-radius: 999px; background: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3); font-weight: 600; font-size: 0.85rem; margin-bottom: 1rem; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="status-badge">● System Status: Healthy</div>
+        <h1>📚 Polite Scraper Metrics Dashboard</h1>
+        <div class="subtitle">Last Run Execution Time: {report["start_time"]}</div>
+        
+        <div class="grid">
+            <div class="card">
+                <div class="card-label">Total Valid Books</div>
+                <div class="metric">{report["valid_records"]}</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Average Price</div>
+                <div class="metric">£{avg_price:.2f}</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Price Range</div>
+                <div class="metric" style="font-size: 1.5rem;">£{min_price:.2f} - £{max_price:.2f}</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Failed Pages</div>
+                <div class="metric" style="color: {'#ef4444' if report['failed_pages'] > 0 else '#4ade80'};">{report["failed_pages"]}</div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>"""
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
 def main() -> None:
     start_time_utc = datetime.now(timezone.utc).isoformat()
     start_timer = time.time()
@@ -319,6 +390,9 @@ def main() -> None:
     with open(errors_file, "w", encoding="utf-8") as f:
         json.dump(error_records, f, indent=2)
 
+    # Extras 1: Export to CSV (output/books.csv)
+    export_to_csv(valid_books, os.path.join("output", "books.csv"))
+
     duration = time.time() - start_timer
     cache_files_count = len([f for f in os.listdir("cache") if os.path.isfile(os.path.join("cache", f))])
 
@@ -333,7 +407,12 @@ def main() -> None:
         failed_count=failed_pages_count
     )
 
+    # Extras 2: Generate HTML Dashboard (output/dashboard.html)
+    generate_html_dashboard(valid_books, report, os.path.join("output", "dashboard.html"))
+
     print(f"\nCHECKPOINT — output/books.json has {len(valid_books)} valid records.")
+    print(f"CHECKPOINT — output/books.csv generated for spreadsheets.")
+    print(f"CHECKPOINT — output/dashboard.html generated for observability.")
     print(f"CHECKPOINT — output/run-report.json generated:")
     print(json.dumps(report, indent=2))
 
