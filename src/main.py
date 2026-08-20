@@ -8,43 +8,54 @@
 
 import os
 import sys
+import requests
 
-def main() -> None:
-    print("Polite Scraper Initialized. Stage 0 setup verified.")
-if __name__ == "__main__":
-    main()
+# Define polite User-Agent identification header
+USER_AGENT = "FlyRankInternship-A9/1.0 (+https://github.com/Mirah-003/polite-scraper)"
+HEADERS = {"User-Agent": USER_AGENT}
 
-# PSEUDOCODE & VISUAL MECHANICS:
-# Import os, sys, time, json, re, datetime (timezone, datetime)
-# Import requests, BeautifulSoup from bs4, urljoin from urllib.parse
-# Import BaseModel, Field, Optional from pydantic
-
-# Create directories: 'cache/' and 'output/' if they don't exist yet.
-
+# Create required directories if they don't exist
+os.makedirs("cache", exist_ok=True)
+os.makedirs("output", exist_ok=True)
 
 # ==========================================
 # TODO 1 — Fetch Once, Cache Once (HTTP Fetcher)
 # ==========================================
 
-# PSEUDOCODE & VISUAL MECHANICS:
-# Function fetch_page(url: str, cache_filename: str) -> tuple[str, bool]:
-#   """
-#   WHY THIS WAY: Saves local copy in cache/.
-#   If file exists on disk -> CACHE HIT (0ms network cost, 0 server load).
-#   If file missing -> FETCH via requests, write to cache/ (1 network call).
-#   """
-#   1. Set cache_path = os.path.join("cache", cache_filename)
-#   2. If os.path.exists(cache_path):
-#        Read content from disk
-#        Return (content, is_cache_hit=True)
-#
-#   3. Define headers = {"User-Agent": "FlyRankInternship-BE05/1.0 (+https://github.com/Mirah-003/polite-scraper)"}
-#   4. Execute response = requests.get(url, headers=headers, timeout=10)
-#   5. Check status code:
-#        If status != 200: raise Exception(f"HTTP {response.status_code}")
-#   6. Save response.text to cache_path
-#   7. Return (response.text, is_cache_hit=False)
-
+def fetch_page(url: str, cache_filename: str, timeout: int = 10) -> tuple[str, bool]:
+    """
+    Politely fetches a web page or loads it from local disk cache.
+    
+    - Returns tuple: (html_content, is_cache_hit)
+    - If cache_filename exists in cache/ -> reads disk (CACHE HIT).
+    - If missing -> sends HTTP GET request, checks 200 OK, writes to cache/ (FETCH).
+    """
+    cache_filepath = os.path.join("cache", cache_filename)
+    
+    # 1. Disk Cache Check
+    if os.path.exists(cache_filepath):
+        with open(cache_filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+        print(f"CACHE HIT | File: {cache_filename} | Size: {len(content)} bytes")
+        return content, True
+    # 2. Network Fetch (If not in cache)
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=timeout)
+        
+        # Verify HTTP status code
+        if response.status_code != 200:
+            raise RuntimeError(f"HTTP Error {response.status_code} when fetching {url}")
+            
+        content = response.text
+        
+        # Save HTML to cache file on disk
+        with open(cache_filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+            
+        print(f"FETCH     | URL: {url} | Size: {len(content)} bytes")
+        return content, False
+    except requests.RequestException as e:
+        raise RuntimeError(f"Network failure for {url}: {e}")
 
 # ==========================================
 # TODO 2 — Find All Three Pages (Pagination Crawler)
@@ -154,3 +165,12 @@ if __name__ == "__main__":
 #   Write valid_books to output/books.json
 #   Write error_records to output/errors.json
 #   Write metrics to output/run-report.json
+
+def main() -> None:
+    # Test Stage 1: Fetch and cache Catalogue Page 1
+    target_url = "https://books.toscrape.com/catalogue/page-1.html"
+    cache_file = "catalogue-page-1.html"
+    
+    fetch_page(url=target_url, cache_filename=cache_file)
+if __name__ == "__main__":
+    main()
